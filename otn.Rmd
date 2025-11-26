@@ -1,0 +1,203 @@
+---
+title: "Sample for otn tagging"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: FALSE
+    code_folding: show
+    number_sections: TRUE
+---
+
+# SET-UP
+
+```{r markdown, echo=F}
+library(knitr)
+opts_chunk$set(echo = T, collapse = T, fig.align = "center", fig.width = 9, fig.height = 6)
+options(width = 140)
+```    
+
+```{r settings, message = F}
+source('settings/settings.R')
+source('settings/passwords.R')
+```
+
+# LENGTH-FREQUENCIES
+```{r lf, message = F}
+lfR <- "Rdata/lf.Rdata"
+
+if(!file.exists(lfR)){
+    lf <- get.lf(species='maquereau',user=imlp.user,password=imlp.pass)
+    
+    # length: m to mm, consistent 5mm bins
+    lf$length <-roundFish(lf$length*1000,5) # idem to carbio before
+    
+    save(lf, file = lfR)
+}else{
+    load(lfR)
+}
+
+# Creation time
+df <- file.info(list.files(dir.rdat, full.names = T,pattern="lf"))
+df[which.max(df$mtime),'mtime']
+```
+
+# BIO
+```{r bio, message = F}
+bioR <- "Rdata/bio.Rdata"
+
+if(!file.exists(bioR)){
+    bio <- get.bio(species='maquereau',user=imlp.user,password=imlp.pass)
+    
+    # length column
+    bio$length.fresh <- NULL # never the case
+    names(bio)[12] <- 'length'  # frozen length = length
+    
+    # length: m to mm, consistent 5mm bins
+    bio$length <- bio$length.frozen*1000 # idem to carbio before
+    bio$length.frozen <- NULL
+    
+    # correct mistakes
+    bio[bio$nafo=='4WE','nafo'] <- '4W'
+    
+    # save
+    save(bio, file = bioR)
+}else{
+    load(bioR)
+}
+
+# Creation time
+df <- file.info(list.files(dir.rdat, full.names = T,pattern="bio"))
+df[which.max(df$mtime),'mtime']
+
+# Add gsi
+bio$gsi <- with(bio,wgonad/weight*100)
+bio$length <-roundFish(bio$length,5) # round to nearest 5cm, to match with lf
+```
+
+
+# OTN
+
+## select samples 2024 Ben
+```{r otndat, message = F}
+# select bios
+otn.bio <- bio[grepl("Ben Miller",iconv(bio$remark, from = "ISO-8859-1", to = "UTF-8"),TRUE) &
+                  bio$year==2024 ,]
+
+# selects lfs
+otn.lf <- lf[lf$sample.id %in% unique(otn.bio$sample.id),]
+```
+
+## GSI?
+```{r gsi, message = F}
+# merge bios (only matur(ing fish) with lf
+gsi <- otn.bio[otn.bio$matur>1 &!is.na(otn.bio$matur),] # remove immature fish
+otn <- ddply(gsi,c("date","sample.id","length"),summarise,gsi=mean(gsi,na.rm=T))
+otn <- merge(gsi,otn.lf[,c("length","sample.id","n")],all.x=T)
+
+# length-frequencies for that one sample are missing... 
+otn[otn$sample.id==74329,"n"] <- 1 # no lf info; not corrected for random sampling
+otn$corrected <- ifelse(otn$sample.id==74329,TRUE,FALSE)
+
+# get average and CI
+otn <- otn[!is.na(otn$n),]
+weighted.sd <- function(mu, x, w) {
+    if (sum(w) > 1) {
+        if(length(unique(w)) == 1) sd(x) else{
+            sqrt(sum(w * (x - mu)^2)/(sum(w - 1)))
+        }
+    }else{NA}
+}
+
+out <- ddply(otn,c("date","sample.id","corrected"),summarise,logmu=weighted.mean(log(gsi),n),logsd=weighted.sd(logmu,log(gsi),n))
+out$mu <- exp(out$logmu)
+out$low <- exp(out$logmu-1.96*out$logsd)
+out$high <- exp(out$logmu+1.96*out$logsd)
+
+p1 <- ggplot(out,aes(x=date,y=mu,col=corrected))+
+    geom_point()+
+    geom_errorbar(aes(ymin=low,ymax=high))+
+    scale_color_manual(values=c("darkred","darkgreen"))
+p1
+```
+
+### Effect of not correcting using the length-freqs is small...
+```{r gsi check, message = F}
+out2 <- ddply(otn,c("date","sample.id","corrected"),summarise,logmu=mean(log(gsi)),logsd=sd(log(gsi)))
+out2$mu <- exp(out2$logmu)
+out2$low <- exp(out2$logmu-1.96*out2$logsd)
+out2$high <- exp(out2$logmu+1.96*out2$logsd)
+
+p2 <- ggplot(out2,aes(x=date,y=mu,col=corrected))+
+    geom_point()+
+    geom_errorbar(aes(ymin=low,ymax=high))+
+    scale_color_manual(values=c("darkred","darkgreen"))
+grid.arrange(p1+ggtitle("with lf"),p2+ggtitle("wo lf"))
+
+```
+
+### historic comparison
+What to expect?
+No outlier removal...just a quick look
+```{r historic weight vs wgonad, message = F}
+spawn <- bio[bio$month %in% 6:7 & 
+             bio$matur>1 &
+             !is.na(bio$matur)&
+             bio$weight>0.1,] # a bit simplified...
+ggplot(spawn,aes(x=weight,y=wgonad,col=month.abb[month]))+geom_point()
+```
+
+### historic
+What to expect? Mature fish only in June (all regions, gears, etc.)
+```{r historic gsi, message = F}
+d <- spawn[spawn$month %in% 7,]
+phist <- ggplot(d,aes(x=gsi))+
+    geom_histogram()+
+    coord_flip()+
+    scale_x_continuous(limits=c(0,20),expand = c(0,0))
+
+logmuhist <- mean(log(d$gsi),na.rm=T)
+lowhist <- exp(logmuhist-1.96*sd(log(d$gsi),na.rm=T))
+highhist <- exp(logmuhist+1.96*sd(log(d$gsi),na.rm=T))
+pnew <- ggplot(out,aes(x=date))+
+    geom_point(aes(y=mu,col=corrected))+
+    geom_errorbar(aes(ymin=low,ymax=high,col=corrected))+
+    scale_color_manual(values=c("darkred","darkgreen"))+
+    geom_ribbon(aes(ymin=lowhist,ymax=highhist),fill="darkgrey",alpha=0.5)+
+    geom_hline(yintercept=exp(logmuhist),col="darkgrey")+
+    theme(legend.position = "none")+
+    scale_y_continuous(limits=c(0,20),expand = c(0,0))
+
+grid.arrange(pnew,phist,ncol=2)
+```
+
+## maturity stages?
+```{r mat, message = F}
+
+# merge bios
+ma <- dcast(data = otn.bio,formula = sample.id+date+length~matur)
+ma <- merge(ma,otn.lf[,c("length","sample.id","n")],all.x=T)
+ma <- ma[,-12]
+
+# length-frequencies for that one sample are missing... 
+ma[ma$sample.id==74329,"n"] <- 1 # no lf info; not corrected for random sampling
+ma$corrected <- ifelse(ma$sample.id==74329,TRUE,FALSE)
+ma <- ma[!is.na(ma$n),]
+mal <- melt(ma,id=c("sample.id","length","date","n","corrected"),variable.name = "stad_mat")
+
+# make maturity classes understandable
+url <- "https://raw.github.com/iml-assess/catchR/master/data-raw/bio_matur.csv"
+matclass<-read.csv(url)
+mal <- merge(mal,matclass)
+
+# plot
+ggplot(mal,aes(x=date,y=value,fill=matur_class))+
+    geom_bar(stat="identity")+
+    scale_fill_viridis_d()
+
+```
+
+## age comps?
+can't do this without lf for first june sample...
